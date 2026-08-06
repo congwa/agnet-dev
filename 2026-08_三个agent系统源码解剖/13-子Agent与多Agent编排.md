@@ -73,7 +73,7 @@ Pi 的整个立场就建立在这个论证上（见 2.2）。而 Codex 和 LangC
 - A 读了 `auth.ts` 的第 10-50 行，B 在 A 读完之后把 20 行删了，A 基于旧内容生成的 patch 现在要么打不上，要么打上去把 B 的改动覆盖了。
 - 更隐蔽的情况：A 看到 `auth.ts` 里有个它不认识的函数（其实是 B 刚加的），觉得这是脏代码，**把它删了**。
 
-数据库有事务，git 有 merge，agent 之间什么都没有。三家 harness 里没有任何一家提供了机制层面的解决方案。Codex 的解法完全在提示词层：内置的 `worker` 角色描述里逐字写着「明确分配文件所有权」和「告诉 worker 它不是唯一在这个代码库里的人，不要回滚别人的改动」（见 3.3）。这是一个诚实但脆弱的答案——它依赖模型听话。
+数据库有事务，git 有 merge，agent 之间什么都没有。三家 harness 里没有任何一家提供了机制层面的解决方案（第四个样本 Grok Build 提供了，见第 8 节）。Codex 的解法完全在提示词层：内置的 `worker` 角色描述里逐字写着「明确分配文件所有权」和「告诉 worker 它不是唯一在这个代码库里的人，不要回滚别人的改动」（见 3.3）。这是一个诚实但脆弱的答案——它依赖模型听话。
 
 ### 1.6 成本与递归爆炸
 
@@ -767,7 +767,7 @@ scoped namespace. ...
 
 **3. 回传格式里放坐标，不放内容。** Pi 的 scout 要求「`path/to/file.ts` (lines 10-50) - 这里有什么」，这一条同时满足了两个矛盾的目标：主 agent 上下文不被文件内容淹没，同时又保留了定点重读的能力。任何「探索型子 agent」的输出格式都应该抄这个：**结论 + 精确坐标 + 从哪开始看**。配套地，还要像 Codex 的 explorer 描述那样明确告诉父 agent「一般不要复查」，否则省下来的 token 会在复查里花掉。
 
-**4. 并行写代码之前，先把写集切开，并且告诉每个 worker 它不是一个人。** 三家里没有任何一家在机制上解决了这个问题，所以你只能靠纪律。Codex 的两条提示词值得逐字借用：给每个 worker **明确的文件/模块所有权**；显式告诉它「代码库里还有别人在改，不要回滚别人的改动，要适配别人的改动」。第二条尤其重要——没有这句话，worker 看到自己没写过的代码时会倾向于当作垃圾清掉。如果你的场景允许，更硬的方案是给每个 worker 开一个 `git worktree`，最后由父 agent 做 merge——这三家都没做，但你可以做。
+**4. 并行写代码之前，先把写集切开，并且告诉每个 worker 它不是一个人。** 三家里没有任何一家在机制上解决了这个问题，所以你只能靠纪律。Codex 的两条提示词值得逐字借用：给每个 worker **明确的文件/模块所有权**；显式告诉它「代码库里还有别人在改，不要回滚别人的改动，要适配别人的改动」。第二条尤其重要——没有这句话，worker 看到自己没写过的代码时会倾向于当作垃圾清掉。如果你的场景允许，更硬的方案是给每个 worker 开一个 `git worktree`，最后由父 agent 做 merge——这三家都没做（Grok Build 做了，`isolation: "worktree"`，见第 8 节），你也可以做。
 
 **5. 失败要翻译成人话，并且附带下一步建议。** `"This agent's turn failed. If you still need this agent, use the available collaboration tools to give it another task."` 这一句的价值在于它把「错误」变成了「可执行的状态」。同理，Codex 的深度超限返回的是 `"Agent depth limit reached. Solve the task yourself."` 而不是一个错误码。所有面向 LLM 的错误路径都应该这么写：**发生了什么 + 你现在可以做什么**。
 
@@ -792,3 +792,28 @@ scoped namespace. ...
 4. **`multi_agent_v2` 的消息加密（`JsonSchema::with_encrypted()`）具体做了什么没搞清楚。** v2 的 `spawn_agent.message`、`send_message.message`、`followup_task.message` 都带这个标记，v1 没有。从 `communication_from_tool_message` 看，非 `DirectPlaintextMessage` 来源会走 `InterAgentCommunication::new_encrypted`。这大概率跟 Responses API 的加密推理内容有关，而不是传统意义上的加密，但我没有确认。
 
 5. **`awaiter` 角色为什么被注释掉。** 代码注释只写了「Awaiter is temp removed」，没有原因。从设计上看它是最纯粹的「上下文卸载」用例，被移除有点可惜；可能跟 v2 引入了更好的后台任务机制有关，也可能是效果不好。
+
+## 8. 第四个样本：Grok Build
+
+> 调研时间 2026-08-06，`xai-org/grok-build` commit `a5589e9`；全项目背景与总体判断见 [17 番外](./17-番外-GrokBuild全项目速览.md)。本节只讲子 agent 维度。
+
+**一句话**：Grok Build 把子 agent 做成一等公民，形态是「后台任务池」而非 Codex v2 的 actor 网络；它是四个样本里唯一给 1.5 节的并行写冲突提供**机制层**解法的（`isolation: "worktree"`），也是唯一把「异步」设为默认的。
+
+**机制**：入口是 `task` 工具，每个子 agent 是一个独立的 ACP 子会话。`TaskToolInput`（`crates/common/xai-tool-types/src/task.rs:14-110`）的字段本身就是设计立场的清单：
+
+| 字段 | 值/默认 | 对照 |
+|---|---|---|
+| `run_in_background` | **默认 true**（task.rs:21-30，"This is set to true by default"） | 三个主样本默认全是同步等待（Pi 等子进程退出、Codex v1 `wait_agent`、LangChain `.invoke()`）；Grok 直接把 1.2 节的邮箱模型设为默认 |
+| `capability_mode` | read-only / read-write / execute / all | 声明式能力面，对照 Pi 的 `--tools` 白名单 |
+| `isolation` | none（默认）/ **worktree** | 工具描述逐字："Worktree mode prevents the child's edits from…"（task.rs:55-56）——独立 git worktree，完成后保留并返回路径。**这就是 6 节经验第 4 条里"三家都没做"的那件事** |
+| `resume_from` | 已完成子 agent 的 id | 继承 peer 的 transcript 和工具状态；与 worktree 互斥（task.rs:83） |
+
+内置三型 `general-purpose` / `explore`（只读）/ `plan`（只读架构师）（task.rs:867-990），与 Codex 的 default/explorer/worker 三角色几乎一一对应。用户自定义 agent 是 `.md` + frontmatter，发现顺序里**原生认 `~/.claude/agents/`**（`xai-grok-agent/src/discovery.rs:186-189`）——Pi 用同样的 markdown+frontmatter 格式但只认自己的目录，Grok 直接兼容 Claude Code 的。嵌套深度默认 1（`MAX_SUBAGENT_DEPTH: u32 = 1`，`task/mod.rs:36`），与 Codex 的默认值相同——两家产品在 1.6 节的递归爆炸问题上独立收敛到同一个数。
+
+**上下文继承是第三种答案**。第 3.2 节讲过 Codex v1（默认不继承）到 v2（默认全继承）的摇摆，Grok 的 `InitialContextSource`（`subagent/mod.rs:52-63`）三档：`New`（默认，只带 task prompt + 压缩版 AGENTS.md）、`Forked`（父会话史规范化成一条 `<background_context>` 用户消息——**最多 3 个完整 turn 逐字保留、更早的只留统计摘要**，并剥掉 system-reminder/git_status 等噪声标签，`xai-grok-subagent-resolution/src/context.rs:11-48`）、`Resumed`。`Forked` 是隔离-理解轴上的折中：既不像 v1 那样让子 agent 盲干，也不像 v2 那样付全量 fork 的 token——**衰减式继承**（近处逐字、远处摘要）正是第 04 章压缩的思路被搬到了 spawn 时刻。
+
+**回传与管理**：tool result 带 `SubagentCompletedOutput`（output + `<subagent_meta>` 统计 + resume 提示，task.rs:210-253）；后台模式先返回 id，由 `get_task_output`（可多 id 聚合等待，上限 20）/ `wait_tasks`（wait_any|wait_all）/ `kill_task` 管理（task.rs:444-478, 656-714）。**没有 agent 互发消息**——父模型对运行中的子 agent 只有 poll/wait/kill，`resume_from` 仅限已完成者。也就是说 Grok 停在了 Codex v1.5 的位置：邮箱化了等待，但没有走到 v2 的任意 agent 网络。防提前收尾靠 `Stop` hook 的 payload 枚举在飞的 `backgroundTasks`（`hooks/src/event.rs:255-288`）。
+
+**编排的第四种载体**。本章看过三种编排逻辑的居所：Pi 写在 prompt 模板里、Codex 放在模型脑子里（ultra 档自主委派）、LangChain 写成 Python 代码。Grok 的 `workflow` 工具给了第四种：**模型现场生成 Rhai 脚本**，host 函数只有 `agent()/parallel()/phase()/log()`（`xai-workflow/src/engine.rs:461-710`），预算护栏 `DEFAULT_AGENT_BUDGET=128`、上限 1024、`MAX_HOST_CALLS=10_000`（lib.rs），支持 `validate_only` 干跑和 `resume_from_run_id` 断点续跑。它比 Pi 的 chain 有真控制流、比 Codex 的"模型自由发挥"可审计、比 LangChain 的预写代码灵活——代价是脚本本身也是模型生成物，第 2.3 节"模型完全可以决定跳过 planner"的问题只是从 prompt 层挪到了 DSL 层。
+
+**本节未确认**：并发子 agent 数量的硬上限未找到（20 是 `get_task_output` 查询侧上限，不是并发侧）；`Forked` 模式的 3-turn 常量是否可配置未查。

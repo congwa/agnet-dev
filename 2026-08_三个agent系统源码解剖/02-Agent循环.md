@@ -592,3 +592,55 @@ Codex 这套的强项在于延迟：预热 WebSocket、边流边跑工具、传�
 - **Codex `preempt_for_mailbox_mail` 的完整语义。** `turn.rs:2360` 有一条在 reasoning / commentary item 之后检查 mailbox 并提前 `break` 出流循环的分支，注释标了「todo: remove before stabilizing multi-agent v2」。这条路径与常规 steer 的关系（是否会丢弃已收到但未处理的流内容）**⚠️ 未确认**。
 - **LangChain `Send("tools", ...)` 的并发上限。** 每个 tool_call 一个 Send，同超步并发执行，但 runner 是否有并发度限制、由哪个配置控制，我没有在 `pregel/_runner.py` 里定位到确切答案，**⚠️ 未确认**。
 - **任务指引中提到的 LangChain `agents/_execution.py`** 在 1.3.14 的代码树里不存在；同名文件位于 `agents/middleware/_execution.py`，内容是持久化 shell 的执行策略（子进程/沙箱/Docker），与 agent 循环无关。本章据此改用 `factory.py` + LangGraph Pregel 作为循环执行的证据来源。
+
+---
+
+## 8. 第四个样本：Grok Build
+
+> 调研时间 2026-08-06，`xai-org/grok-build` commit `a5589e9`；全项目背景见 [17 番外](./17-番外-GrokBuild全项目速览.md)。本节只看循环维度。
+
+**一句话**：三层嵌套手写 loop，形状是 Codex 同族；但它在两个三家都没做透的地方走出了新东西——**停止前要过三道闸**，以及**把"模型转圈"当一等失败模式硬编码熔断**。
+
+### 8.1 循环形状：三层手写 loop
+
+| 层 | 位置 | 职责 |
+|---|---|---|
+| L0 会话 actor | `xai-grok-shell/src/session/acp_session_impl/run_loop.rs:123` `run_session()`，`loop { tokio::select! { biased; … } }` | 事件多路复用：命令通道、状态事件、定时器、model-switch watch |
+| L1 prompt 外层轮 | `turn.rs:849` | goal-loop 续跑 + stop gate 重开轮 |
+| L2 采样内层轮 | `turn.rs:2004`（`process_conversation_turn` 内） | 经典 build request → sample → 执行工具 → continue |
+
+一次只跑一个 turn：prompt 进 `VecDeque` FIFO，单个 `running_task` 槽，"arming a new one aborts the previous"（tasks_cancel.rs:109）。与 Pi 的双层 while、Codex 的 Task→run_turn→sampling 三层同构——四个样本里三个产品全部收敛到"手写嵌套 loop"，图调度依然只有 LangChain 一家。
+
+### 8.2 停止条件：无 toolCall 只是必要条件，还要过三道闸
+
+`turn.rs:2499` 起，`tool_calls.is_empty()` 之后依次是：
+
+1. **TodoGate**：todos 未清时注入 reminder 并 `continue` 强迫模型继续，每 prompt 有 `max_fires_per_prompt` 上限（turn.rs:2506-2551）——Pi 的立场是 "to-dos confuse models" 干脆不做，Codex 用 prompt 约束按住，Grok 则把 todo 完成度做成了**停止条件的一部分**；
+2. **插话二次排水**：pending 插话排到了就 `continue` 不停（turn.rs:2554-2570，两次检查夹住收尾竞态窗口）；
+3. **stop gate**：`Completed` 后还要问一道 `StopGateDecision`，`KeepWorking { feedback }` 时把 feedback 作为用户消息 push 进对话并重开一轮（turn.rs:896-906）——Claude Code stop-hook 的同款语义，对照 Codex 的 `should_stop`。
+
+硬上限：`max_turns` 是 `Option<usize>`，`None` = 无限（来自 CLI `--max-turns`），检查在 turn.rs:2697-2708。默认值来源只追到 spawn 参数，⚠️ 未确认全部调用方的默认。
+
+### 8.3 防转圈：四个样本里唯一的显式 stationarity 熔断
+
+```rust
+// turn.rs:2724-2728
+const MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS: u32 = 16;
+const NUDGE_AFTER_IDENTICAL_TOOL_CALLS: u32 = 8;
+const MAX_CONSECUTIVE_TRUE_NOOPS: u32 = 4;
+```
+
+连续相同 (tool, args) 签名 8 次注入 nudge、16 次硬停；`run true` 类空转 4 次即停；常量之间还有编译期 `const _: () = assert!(...)` 断言。硬停返回专用变体 `TurnOutcome::StationarityEnded`，类型注释明确"Distinct from Completed so recovery/goal/stop-hook cannot re-open the sampling loop"——防的是熔断被 8.2 的三道闸（尤其 stop gate）重新点火。本章 §5 对照表里 Pi/Codex 的"硬迭代上限"都填的是"无"，LangChain 靠 recursion_limit 兜底；Grok 是唯一按**行为模式**（而非次数上限）熔断的。
+
+### 8.4 用户插话：排队与打断两种范式并存
+
+本章写过 Pi 的 steer 队列和 Codex 的 abort-and-replace。Grok 两个都要：
+
+- **默认 Pi 式排队，且更激进**：插话进 `InterjectionBuffer`（抽成共享 crate `xai-interjection-core`，注释说是为了 "so the server-side agent loop can adopt the same semantics"），"An interjection never cancels the turn"（interjection.rs:332）；排水点在**同一 turn 内**的循环边界（内层 loop 顶部 turn.rs:2078 + 收尾前两次），不必等 turn 结束——Pi 是 turn 边界注入，Grok 是循环边界注入。注入形态是独立的合成用户消息，"never appended to tool results"。
+- **显式 Codex 式硬中断**：普通 prompt 可带 `send_now` 标志（commands.rs:233 "Cancel-and-send: cancel the running turn and run this prompt next"），走真 `task.abort()` + 先杀前台终端进程。
+- **唯一能被插话打断的工具**是 sleep/wait 类：用 `tokio::select!` 挂在 `wait_for_pending_interjection` 上，插话到达即中止该工具返回合成结果（tool_calls.rs:562-580）。采样流本身不被插话打断——此推断基于排水点分布，⚠️ 未逐行核验 `run_turn_via_sampler` 内部。
+
+### 8.5 本节未确认
+
+- `max_turns` 各调用方的默认值。⚠️ 未确认。
+- SSE 采样流中途是否存在插话检查点（按排水点清单推断为无，置信度高）。⚠️ 未逐行确认。

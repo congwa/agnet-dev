@@ -587,3 +587,21 @@ _SERVER_TOOL_SEARCH_TOOLS: dict[str, _ServerToolSearchSpec] = {
 - ⚠️ 未确认：Codex 的 tool search 在 MCP 工具上的实际召回质量。`apply_mcp_tool_exposure_policy` 会在 tool search 开启时把 MCP 工具整体从 DIRECT 转成 DEFERRED，这意味着**模型不主动搜就永远看不到它们**。仓库里没有相关的 benchmark，也没看到"搜不到时的兜底"逻辑。
 - **`codex_mcp_interface.md` 与代码不一致，已在 3.2 节写明。** 文档说 `codex mcp-server` 暴露 `thread/*` `turn/*` 等 v2 RPC 且类型来自 `app-server-protocol`，但 `mcp-server/Cargo.toml` 不依赖那个 crate，`message_processor.rs` 也没有对应的方法分发。⚠️ 未确认：这是文档滞后于代码重构，还是描述的是计划中的能力。读这一块时以代码为准。
 - Pi 的博客论证里没有提到 elicitation（MCP 的 server→client 反向通道）。CLI 工具在这一维度上没有等价物——一个 CLI 脚本没法在执行到一半时问用户一个问题并等回答（除非它自己去抢 TTY）。这个能力差距在本章的对比表里没有体现，因为 Pi 侧根本没有对应项。
+
+## 8. 第四个样本：Grok Build
+
+> 调研时间 2026-08-06，`xai-org/grok-build` commit `a5589e9`；全项目背景见 [17 番外](./17-番外-GrokBuild全项目速览.md)。本节只看 MCP 维度。
+
+**立场：全面拥抱，作为 client；对外暴露自己时不用 MCP，用 ACP。** 在本章"全面拥抱 / adapter 接入 / 明确拒绝"的三分坐标上，Grok 落在 Codex 那一格，但底座选择相反——Codex 自研协议实现，Grok 用官方 rmcp SDK 2.1，还把它隔离在专用 crate 里（`xai-grok-mcp/Cargo.toml:6` 描述原话："Quarantines rmcp + reqwest 0.13 (rmcp 2.1 requires reqwest >= 0.13.2 while the rest of the workspace uses reqwest 0.12) and owns the MCP credential store and OAuth flow orchestrator."）——为了一个依赖的 reqwest 版本冲突单独开检疫区，工程洁癖可见一斑。
+
+**transport 与修补**：stdio / Streamable HTTP / SSE 三种配置级（`servers.rs:856-857, 4356-4366`）。值得注意的是它对上游 SDK 的两处自修：stdio 用自实现的 `SafeTokioChildProcess` 修 rmcp 的 Drop-spawn 问题（`servers.rs:2043-2231`）；HTTP 侧自带指数退避包装修 rmcp SSE 零退避重连（`mcp_http_client.rs`）。用官方 SDK 不等于免维护——协议实现的坑最终还是自己填。
+
+**企业侧三件套齐全**（对照第 1 节列的"接企业 server 的基础设施税"）：OAuth 完整（浏览器流 + 跨进程去重，`src/oauth.rs`），凭据落 `$GROK_HOME/mcp_credentials.json`；配置源含**仓库级 `.mcp.json`（Claude Code 兼容格式）**与 config.toml；工具命名 `server__tool` 双下划线拼接（`servers.rs:42-46`）——注意这里**没有** Codex 那套 sanitize + SHA1 + ≤64 字节的长度处理（未见对应代码，长名/冲突行为未确认）。
+
+**上下文开销的答案与 Codex 同构**：`search_tool`（BM25 检索 MCP 工具）+ `use_tool`（按检索到的 schema 转发）二段式延迟加载（`implementations/search_tool/mod.rs:1`、`use_tool/mod.rs:1-27`），输出侧 `MCP_MAX_OUTPUT_BYTES = 20_000` **按字节**截断（`util/mcp_truncate.rs:34-42`，注释点名"Some agents use MAX_MCP_OUTPUT_TOKENS; we bound by bytes"）。第 7 节说"没有人会为不存在的问题写这么多代码"——第四个样本又写了一遍。
+
+**子 agent 的 MCP 继承是四家里做得最显式的**：spawn 时快照 `SharedMcpPool`，`Arc<McpClient>` 共享传输、工具 map 独立（`servers.rs:928-935`）；agent 定义可声明 `mcp_inheritance: All|None|Named|Except`（`xai-grok-agent/src/config.rs:935-941`）——把"子 agent 能看到哪些外部工具"做成了声明式配置，而不是隐式继承。
+
+**自身不当 MCP server**：CLI 子命令全集里没有 `mcp serve`（`pager/src/app/cli.rs:9-146`），对外暴露走 ACP（`grok agent stdio`）和 WebSocket。这和 Codex 的 `codex mcp-server` 形成对照——Grok 把"被嵌入"这件事整个押在了 ACP 上。两个特殊变体：SDK 进程内 MCP **反向桥**（SDK 宿主进程里 `create_sdk_mcp_server` 定义的 server，agent 经 ACP 扩展方法 `x.ai/mcp/sdk_call` 反向调用，再适配成 rmcp transport，半双工、不支持 server→client 的 sampling/notifications，`acp_transport.rs:1-20`）；以及 `computer-hub-mcp-adapter`——把 MCP server 桥进 xAI 自家的远程工具路由基础设施 Computer Hub（local-shadows-remote 的 `CompoundResolver`，`xai-computer-hub-core/src/lib.rs:1-29`），对应 `grok workspace` 把本地工作区暴露给云端。
+
+本节未确认：SSE 配置最终走独立传输还是统一降级到 Streamable HTTP（refresh 路径把 Http/Sse 同等映射 `HttpConfig`，初始建连路径未逐行核对）；MCP 工具名超长/冲突时的处理；`annotations.readOnlyHint` 是否参与审批决策未追查。
